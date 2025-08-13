@@ -1,0 +1,842 @@
+# TELEMONITOR PRO - COMPLETE BOT CODE
+# Copy this entire content to deploy your Telegram contract monitoring bot
+
+# ==== FILE: requirements.txt ====
+telethon==1.40.0
+flask==3.1.1
+
+# ==== FILE: config.py ====
+import os
+
+class Config:
+    # Telegram API credentials
+    API_ID = int(os.getenv('API_ID', '20828819'))
+    API_HASH = os.getenv('API_HASH', 'caa62c2b04eede91c4f695a5a8756b1c')
+    PHONE_NUMBER = os.getenv('PHONE_NUMBER', '+2349161890011')
+    
+    # Target group for forwarding clean contracts
+    TARGET_GROUP_ID = int(os.getenv('TARGET_GROUP_ID', '-1002815078949'))
+    
+    # Channels to monitor (these should be public channel usernames or IDs)
+    MONITORED_CHANNELS = [
+        '@basedegenterminal',
+        '@onlyhypealarms', 
+        '@bschypedetector'
+    ]
+    
+    # TTF Bot settings
+    TTF_BOT_USERNAME = '@ttfbotbot'
+    TTF_RESPONSE_TIMEOUT = 60  # seconds
+    
+    # Logging settings
+    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    
+    # Flask settings
+    FLASK_HOST = '0.0.0.0'
+    FLASK_PORT = 5000
+    FLASK_DEBUG = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+
+# ==== FILE: bot.py ====
+import asyncio
+import re
+import logging
+from datetime import datetime
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from config import Config
+import time
+
+logger = logging.getLogger(__name__)
+
+class TelegramBot:
+    def __init__(self):
+        self.client = TelegramClient('userbot_session', Config.API_ID, Config.API_HASH)
+        self.ttf_bot_username = '@ttfbotbot'
+        self.target_group_id = Config.TARGET_GROUP_ID
+        self.monitored_channels = Config.MONITORED_CHANNELS
+        self.contract_pattern = re.compile(r'\b[A-HJ-NP-Z0-9]{32,44}\b')
+        self.pending_contracts = {}  # Store original messages for forwarding
+        
+    async def start(self):
+        """Start the Telegram client and setup event handlers"""
+        try:
+            # Connect to Telegram
+            await self.client.connect()
+            logger.info("Connected to Telegram!")
+            
+            # Check if we're authorized
+            if not await self.client.is_user_authorized():
+                logger.error("❌ Client not authorized!")
+                logger.error("❌ You need to authenticate first!")
+                logger.error("❌ Run the authentication process:")
+                logger.error("❌ 1. Send code: await client.send_code_request('+2349161890011')")
+                logger.error("❌ 2. Sign in: await client.sign_in('+2349161890011', 'YOUR_CODE')")
+                
+                # Try to send code automatically
+                try:
+                    logger.info("🔄 Attempting to send authentication code...")
+                    await self.client.send_code_request(Config.PHONE_NUMBER)
+                    logger.info("✅ Authentication code sent to your Telegram!")
+                    logger.info("📱 Check your Telegram app for the code")
+                    logger.info("❌ Bot cannot continue without authentication")
+                    return
+                except Exception as code_error:
+                    logger.error(f"❌ Failed to send code: {code_error}")
+                    return
+                    
+            logger.info("✅ Bot authenticated successfully!")
+            
+            # Setup event handlers
+            self.setup_handlers()
+            
+            logger.info(f"📺 Monitoring channels: {self.monitored_channels}")
+            logger.info(f"🎯 Target group ID: {self.target_group_id}")
+            logger.info("🤖 Bot is now monitoring for contracts...")
+            
+            # Keep the client running
+            await self.client.run_until_disconnected()
+            
+        except Exception as e:
+            logger.error(f"Error starting bot: {e}")
+            raise
+
+    def setup_handlers(self):
+        """Setup message event handlers"""
+        
+        @self.client.on(events.NewMessage(chats=self.monitored_channels))
+        async def handle_channel_message(event):
+            """Handle new messages from monitored channels"""
+            try:
+                message_text = event.message.message
+                if not message_text:
+                    return
+                
+                logger.info(f"New message from {event.chat.title}: {message_text[:100]}...")
+                
+                # Extract contract addresses
+                contracts = self.extract_contracts(message_text)
+                
+                for contract in contracts:
+                    logger.info(f"Found contract: {contract}")
+                    
+                    # Store the original message for potential forwarding
+                    self.pending_contracts[contract] = {
+                        'original_message': event.message,
+                        'timestamp': datetime.now()
+                    }
+                    
+                    # Send to TTF bot for analysis
+                    await self.analyze_contract(contract)
+                    
+                    # Update stats
+                    from main import update_stats
+                    update_stats(contract_processed=True)
+                    
+            except Exception as e:
+                logger.error(f"Error handling channel message: {e}")
+
+        @self.client.on(events.NewMessage(from_users=self.ttf_bot_username))
+        async def handle_ttf_response(event):
+            """Handle responses from TTF bot"""
+            try:
+                response_text = event.message.message.lower()
+                logger.info(f"TTF bot response: {response_text[:100]}...")
+                
+                # Check if response contains "clean" or "clean!"
+                if 'clean!' in response_text or (response_text.count('clean') > 0):
+                    logger.info("Clean contract detected! Processing for forwarding...")
+                    
+                    # Try to find the corresponding contract
+                    await self.handle_clean_contract(event.message, response_text)
+                    
+            except Exception as e:
+                logger.error(f"Error handling TTF response: {e}")
+
+    def extract_contracts(self, text):
+        """Extract contract addresses from message text"""
+        # Look for Ethereum-like addresses (42 characters starting with 0x)
+        eth_pattern = re.compile(r'\b0x[a-fA-F0-9]{40}\b')
+        eth_matches = eth_pattern.findall(text)
+        
+        # Look for Solana-like addresses (base58, 32-44 characters)
+        sol_pattern = re.compile(r'\b[A-HJ-NP-Z1-9]{32,44}\b')
+        sol_matches = sol_pattern.findall(text)
+        
+        # Combine and filter out duplicates
+        contracts = list(set(eth_matches + sol_matches))
+        
+        # Filter out common false positives
+        filtered_contracts = []
+        for contract in contracts:
+            if len(contract) >= 32 and not contract.isdigit():
+                filtered_contracts.append(contract)
+        
+        return filtered_contracts
+
+    async def analyze_contract(self, contract_address):
+        """Send contract to TTF bot for analysis"""
+        try:
+            logger.info(f"Sending contract to TTF bot: {contract_address}")
+            
+            # Send the contract address to TTF bot
+            await self.client.send_message(self.ttf_bot_username, contract_address)
+            
+            logger.info(f"Contract sent to TTF bot: {contract_address}")
+            
+        except FloodWaitError as e:
+            logger.warning(f"Rate limited, waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+            await self.analyze_contract(contract_address)
+        except Exception as e:
+            logger.error(f"Error sending to TTF bot: {e}")
+
+    async def handle_clean_contract(self, ttf_response, response_text):
+        """Handle clean contract by forwarding messages"""
+        try:
+            # Find the most recent contract that might match this response
+            # Since we can't directly correlate responses, we'll use the most recent one
+            if not self.pending_contracts:
+                logger.warning("No pending contracts to forward")
+                return
+                
+            # Get the most recent contract (this is a simple approach)
+            recent_contract = max(self.pending_contracts.keys(), 
+                                key=lambda x: self.pending_contracts[x]['timestamp'])
+            
+            contract_data = self.pending_contracts[recent_contract]
+            original_message = contract_data['original_message']
+            
+            logger.info(f"Forwarding clean contract: {recent_contract}")
+            
+            # Forward the original message to target group
+            await self.forward_original_message(original_message)
+            
+            # Wait a short delay
+            await asyncio.sleep(2)
+            
+            # Send the TTF bot's analysis
+            await self.send_ttf_analysis(ttf_response)
+            
+            # Clean up
+            del self.pending_contracts[recent_contract]
+            
+            # Update stats
+            from main import update_stats
+            update_stats(clean_found=True)
+            
+            logger.info("Successfully forwarded clean contract messages")
+            
+        except Exception as e:
+            logger.error(f"Error handling clean contract: {e}")
+
+    async def forward_original_message(self, original_message):
+        """Forward the original message exactly as received"""
+        try:
+            # Forward the message to target group - this preserves the exact original message
+            await self.client.forward_messages(
+                entity=self.target_group_id,
+                messages=original_message
+            )
+            
+            logger.info("Original message forwarded successfully")
+            
+        except Exception as e:
+            logger.error(f"Error forwarding original message: {e}")
+            
+            # Fallback: send the message content exactly as received 
+            try:
+                # Send the exact message text without any modification
+                await self.client.send_message(
+                    self.target_group_id,
+                    original_message.message
+                )
+                logger.info("Original message sent as fallback text")
+            except Exception as fallback_error:
+                logger.error(f"Error in fallback message sending: {fallback_error}")
+
+    async def send_ttf_analysis(self, ttf_response):
+        """Send TTF bot's analysis to target group"""
+        try:
+            analysis_text = f"🤖 **TTF Bot Analysis:**\n\n{ttf_response.message}"
+            
+            await self.client.send_message(self.target_group_id, analysis_text)
+            
+            logger.info("TTF analysis sent successfully")
+            
+        except Exception as e:
+            logger.error(f"Error sending TTF analysis: {e}")
+
+    async def cleanup_old_contracts(self):
+        """Clean up old pending contracts to prevent memory buildup"""
+        try:
+            current_time = datetime.now()
+            expired_contracts = []
+            
+            for contract, data in self.pending_contracts.items():
+                if (current_time - data['timestamp']).seconds > 300:  # 5 minutes
+                    expired_contracts.append(contract)
+            
+            for contract in expired_contracts:
+                del self.pending_contracts[contract]
+                
+            if expired_contracts:
+                logger.info(f"Cleaned up {len(expired_contracts)} expired contracts")
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up contracts: {e}")
+
+# ==== FILE: main.py ====
+from flask import Flask, render_template, jsonify
+import threading
+import asyncio
+from datetime import datetime, timedelta
+import logging
+from bot import TelegramBot
+from config import Config
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Global bot instance
+bot_instance = None
+bot_stats = {
+    'status': 'Starting...',
+    'uptime_start': datetime.now(),
+    'contracts_processed': 0,
+    'clean_contracts_found': 0,
+    'last_activity': None,
+    'is_running': False
+}
+
+def run_bot():
+    """Run the Telegram bot in asyncio event loop"""
+    global bot_instance
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        bot_instance = TelegramBot()
+        loop.run_until_complete(bot_instance.start())
+        
+    except Exception as e:
+        logger.error(f"Error running bot: {e}")
+        bot_stats['status'] = f'Error: {str(e)}'
+
+@app.route('/')
+def dashboard():
+    """Main dashboard page"""
+    uptime = datetime.now() - bot_stats['uptime_start']
+    uptime_str = str(uptime).split('.')[0]  # Remove microseconds
+    
+    return render_template('dashboard.html', 
+                         status=bot_stats['status'],
+                         uptime=uptime_str,
+                         contracts_processed=bot_stats['contracts_processed'],
+                         clean_contracts_found=bot_stats['clean_contracts_found'],
+                         last_activity=bot_stats['last_activity'],
+                         is_running=bot_stats['is_running'])
+
+@app.route('/ping')
+def ping():
+    """Health check endpoint for uptime monitoring"""
+    return jsonify({
+        'status': 'alive',
+        'timestamp': datetime.now().isoformat(),
+        'uptime': str(datetime.now() - bot_stats['uptime_start']).split('.')[0]
+    })
+
+@app.route('/api/stats')
+def api_stats():
+    """API endpoint for dashboard stats"""
+    uptime = datetime.now() - bot_stats['uptime_start']
+    return jsonify({
+        'status': bot_stats['status'],
+        'uptime': str(uptime).split('.')[0],
+        'contracts_processed': bot_stats['contracts_processed'],
+        'clean_contracts_found': bot_stats['clean_contracts_found'],
+        'last_activity': bot_stats['last_activity'].strftime('%Y-%m-%d %H:%M:%S') if bot_stats['last_activity'] else None,
+        'is_running': bot_stats['is_running']
+    })
+
+def update_stats(status=None, contract_processed=False, clean_found=False):
+    """Update bot statistics"""
+    global bot_stats
+    
+    if status:
+        bot_stats['status'] = status
+    
+    if contract_processed:
+        bot_stats['contracts_processed'] += 1
+    
+    if clean_found:
+        bot_stats['clean_contracts_found'] += 1
+    
+    bot_stats['last_activity'] = datetime.now()
+    bot_stats['is_running'] = True
+
+if __name__ == '__main__':
+    # Start the bot in a separate thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    # Update initial status
+    update_stats('Bot is ALIVE and monitoring')
+    
+    logger.info("Starting Flask dashboard...")
+    app.run(host='0.0.0.0', port=5000, debug=False)
+
+# ==== FILE: templates/dashboard.html ====
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 TeleMonitor Pro Dashboard</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.1.3/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta http-equiv="refresh" content="30">
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="row">
+            <div class="col-12">
+                <div class="dashboard-header text-center py-4">
+                    <h1 class="display-4">
+                        <i class="fas fa-robot"></i> TeleMonitor Pro Dashboard
+                    </h1>
+                    <div class="status-badge">
+                        <span class="badge {% if is_running %}bg-success{% else %}bg-danger{% endif %} fs-6">
+                            <i class="fas fa-circle pulse"></i> {{ status }}
+                        </span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row g-4">
+            <!-- Status Card -->
+            <div class="col-md-6 col-lg-3">
+                <div class="card stats-card">
+                    <div class="card-body text-center">
+                        <div class="stats-icon">
+                            <i class="fas fa-power-off {% if is_running %}text-success{% else %}text-danger{% endif %}"></i>
+                        </div>
+                        <h5 class="card-title">Current Status</h5>
+                        <p class="card-text status-text">{{ status }}</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Uptime Card -->
+            <div class="col-md-6 col-lg-3">
+                <div class="card stats-card">
+                    <div class="card-body text-center">
+                        <div class="stats-icon">
+                            <i class="fas fa-clock text-info"></i>
+                        </div>
+                        <h5 class="card-title">Uptime</h5>
+                        <p class="card-text stats-number">{{ uptime }}</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Contracts Processed Card -->
+            <div class="col-md-6 col-lg-3">
+                <div class="card stats-card">
+                    <div class="card-body text-center">
+                        <div class="stats-icon">
+                            <i class="fas fa-file-contract text-warning"></i>
+                        </div>
+                        <h5 class="card-title">Contracts Processed</h5>
+                        <p class="card-text stats-number">{{ contracts_processed }}</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Clean Contracts Card -->
+            <div class="col-md-6 col-lg-3">
+                <div class="card stats-card">
+                    <div class="card-body text-center">
+                        <div class="stats-icon">
+                            <i class="fas fa-check-circle text-success"></i>
+                        </div>
+                        <h5 class="card-title">Clean Contracts Found</h5>
+                        <p class="card-text stats-number">{{ clean_contracts_found }}</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Activity Section -->
+        <div class="row mt-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="card-title mb-0">
+                            <i class="fas fa-activity"></i> Activity Information
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <p><strong><i class="fas fa-calendar-alt"></i> Last Activity:</strong> 
+                                    {% if last_activity %}
+                                        {{ last_activity }}
+                                    {% else %}
+                                        <span class="text-muted">No activity yet</span>
+                                    {% endif %}
+                                </p>
+                            </div>
+                            <div class="col-md-6">
+                                <p><strong><i class="fas fa-sync-alt"></i> Auto-refresh:</strong> 
+                                    <span class="text-success">Every 30 seconds</span>
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Monitoring Information -->
+        <div class="row mt-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="card-title mb-0">
+                            <i class="fas fa-eye"></i> Monitoring Configuration
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-4">
+                                <div class="config-item">
+                                    <i class="fas fa-comments text-primary"></i>
+                                    <strong>Monitored Channels:</strong>
+                                    <small class="d-block text-muted">3 Public Channels</small>
+                                </div>
+                            </div>
+                            <div class="col-md-4">
+                                <div class="config-item">
+                                    <i class="fas fa-robot text-info"></i>
+                                    <strong>TTF Bot:</strong>
+                                    <small class="d-block text-muted">@ttfbotbot</small>
+                                </div>
+                            </div>
+                            <div class="col-md-4">
+                                <div class="config-item">
+                                    <i class="fas fa-forward text-success"></i>
+                                    <strong>Target Group:</strong>
+                                    <small class="d-block text-muted">Private Group</small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.1.3/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Auto-refresh indicator
+        let refreshCounter = 30;
+        const refreshIndicator = document.createElement('div');
+        refreshIndicator.className = 'position-fixed bottom-0 end-0 p-3';
+        refreshIndicator.innerHTML = '<small class="text-muted">Auto-refresh in <span id="countdown">30</span>s</small>';
+        document.body.appendChild(refreshIndicator);
+
+        setInterval(function() {
+            refreshCounter--;
+            document.getElementById('countdown').textContent = refreshCounter;
+            if (refreshCounter <= 0) {
+                refreshCounter = 30;
+            }
+        }, 1000);
+    </script>
+</body>
+</html>
+
+# ==== FILE: static/style.css ====
+/* Custom CSS for TeleMonitor Pro Dashboard */
+
+body {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    min-height: 100vh;
+    color: #333;
+}
+
+.dashboard-header {
+    background: rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(10px);
+    border-radius: 15px;
+    margin-bottom: 30px;
+    box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.dashboard-header h1 {
+    color: white;
+    font-weight: 700;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+    margin-bottom: 15px;
+}
+
+.status-badge {
+    margin-top: 10px;
+}
+
+.stats-card {
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(10px);
+    border: none;
+    border-radius: 15px;
+    box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+    height: 100%;
+}
+
+.stats-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 12px 40px 0 rgba(31, 38, 135, 0.5);
+}
+
+.stats-icon {
+    font-size: 2.5rem;
+    margin-bottom: 15px;
+}
+
+.stats-number {
+    font-size: 2rem;
+    font-weight: bold;
+    color: #4f46e5;
+    margin: 0;
+}
+
+.status-text {
+    font-weight: 600;
+    color: #059669;
+    margin: 0;
+}
+
+.card {
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(10px);
+    border: none;
+    border-radius: 15px;
+    box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+}
+
+.card-header {
+    background: rgba(255, 255, 255, 0.1);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 15px 15px 0 0 !important;
+}
+
+.config-item {
+    padding: 15px;
+    background: rgba(248, 250, 252, 0.5);
+    border-radius: 10px;
+    margin-bottom: 10px;
+    transition: background-color 0.3s ease;
+}
+
+.config-item:hover {
+    background: rgba(248, 250, 252, 0.8);
+}
+
+.config-item i {
+    margin-right: 8px;
+    font-size: 1.2rem;
+}
+
+.pulse {
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.5;
+    }
+    100% {
+        opacity: 1;
+    }
+}
+
+/* Badge styles */
+.bg-success {
+    background-color: #059669 !important;
+}
+
+.bg-danger {
+    background-color: #dc2626 !important;
+}
+
+/* Text colors */
+.text-success {
+    color: #059669 !important;
+}
+
+.text-danger {
+    color: #dc2626 !important;
+}
+
+.text-info {
+    color: #0891b2 !important;
+}
+
+.text-warning {
+    color: #d97706 !important;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .dashboard-header h1 {
+        font-size: 2rem;
+    }
+    
+    .stats-icon {
+        font-size: 2rem;
+    }
+    
+    .stats-number {
+        font-size: 1.5rem;
+    }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.5);
+}
+
+/* Loading animation for auto-refresh */
+.position-fixed {
+    z-index: 1000;
+}
+
+.position-fixed small {
+    background: rgba(0, 0, 0, 0.7);
+    color: white;
+    padding: 5px 10px;
+    border-radius: 15px;
+    font-size: 0.8rem;
+}
+
+# ==== AUTHENTICATION SCRIPT ====
+# Run this when you need to authenticate: python auth.py YOUR_CODE
+
+import asyncio
+from telethon import TelegramClient
+from config import Config
+
+async def authenticate_bot(code):
+    client = TelegramClient('userbot_session', Config.API_ID, Config.API_HASH)
+    try:
+        await client.connect()
+        sent_code = await client.send_code_request(Config.PHONE_NUMBER)
+        await client.sign_in(Config.PHONE_NUMBER, code, phone_code_hash=sent_code.phone_code_hash)
+        me = await client.get_me()
+        print(f"✅ Successfully authenticated as: {me.first_name}")
+        await client.disconnect()
+        return True
+    except Exception as e:
+        print(f"❌ Authentication failed: {e}")
+        await client.disconnect()
+        return False
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: python auth.py YOUR_TELEGRAM_CODE")
+        sys.exit(1)
+    code = sys.argv[1]
+    asyncio.run(authenticate_bot(code))
+
+# ==== DEPLOYMENT INSTRUCTIONS ====
+1. Create folder structure:
+   project/
+   ├── config.py
+   ├── bot.py
+   ├── main.py
+   ├── requirements.txt
+   ├── templates/
+   │   └── dashboard.html
+   └── static/
+       └── style.css
+
+2. Set environment variables:
+   - API_ID=20828819
+   - API_HASH=caa62c2b04eede91c4f695a5a8756b1c
+   - PHONE_NUMBER=+2349161890011
+   - TARGET_GROUP_ID=-1002815078949
+
+3. Install dependencies: pip install -r requirements.txt
+4. Authenticate: python auth.py YOUR_CODE
+5. Run: python main.py
+
+# ==== FREE DEPLOYMENT OPTIONS ====
+
+1. **Replit** (Recommended)
+   - Upload files to replit.com
+   - Set environment variables in Secrets
+   - Run with: python main.py
+   - Free tier with 1GB RAM
+
+2. **Railway**
+   - railway.app
+   - Connect GitHub repo
+   - Free tier: 500 hours/month
+   - Easy deployment with GitHub integration
+
+3. **Render**
+   - render.com
+   - Free tier: 750 hours/month
+   - Supports Python apps
+   - Auto-deploy from GitHub
+
+4. **Heroku**
+   - heroku.com
+   - Free tier discontinued but still popular
+   - Paid plans start at $5/month
+
+5. **PythonAnywhere**
+   - pythonanywhere.com
+   - Free tier available
+   - Good for Python applications
+   - Easy file upload
+
+6. **Fly.io**
+   - fly.io
+   - Free tier available
+   - Docker-based deployment
+   - Global deployment
+
+7. **Glitch**
+   - glitch.com
+   - Free hosting for small projects
+   - Web-based editor
+   - Good for simple apps
+
+RECOMMENDED: Use Replit or Railway for easiest deployment with free tiers.
